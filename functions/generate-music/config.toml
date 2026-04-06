@@ -1,0 +1,2 @@
+[functions.generate-music]
+verify_jwt = false
