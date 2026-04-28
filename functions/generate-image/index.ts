@@ -41,9 +41,9 @@ Deno.serve(async (req: Request) => {
   }
 
   // ── リクエストボディ ──────────────────────────────────────
-  const { room_id, prompt } = await req.json();
-  if (!room_id || !prompt) {
-    return errorResponse(400, "serverError", "room_id と prompt は必須です");
+  const { room_id, prompt, user_id, request_id } = await req.json();
+  if (!room_id || !prompt || !user_id || !request_id) {
+    return errorResponse(400, "serverError", "room_id, prompt, user_id, request_id は必須です");
   }
 
   // ── 使用回数チェック ─────────────────────────────────────
@@ -115,9 +115,34 @@ Deno.serve(async (req: Request) => {
     used_at: new Date().toISOString(),
   });
 
-  // ── ⑤ content_id を返す ─────────────────────────────────
+  // ── ⑤ Realtime broadcast を送信（同期実行） ──────────
+  try {
+    const channel = supabase.channel(`user:${user_id}:${request_id}`, {
+      config: { private: true }
+    });
+    await channel.subscribe();
+    await new Promise((resolve) => setTimeout(resolve, 10000))
+    await channel.send({
+      type: "broadcast",
+      event: "content_updated",
+      payload: {
+        id: contentId,
+        room_id: room_id,
+        file_url: fileUrl,
+        prompt_used: promptUsed,
+        status: "pending",
+      },
+    });
+    console.log(`📡 Broadcast sent for user:${user_id}:${request_id}`);
+    await channel.unsubscribe();
+  } catch (broadcastError) {
+    console.error(`❌ Broadcast failed for user:${user_id}:${request_id}:`, broadcastError);
+    // エラーでもレスポンスは返す（クライアント側でタイムアウト処理）
+  }
+
+  // ── ⑥ シンプルなレスポンスを返す ────────────────────
   return new Response(
-    JSON.stringify({ content_id: contentId }),
+    JSON.stringify({ success: true }),
     {
       status: 200,
       headers: {

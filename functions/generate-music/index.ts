@@ -115,7 +115,32 @@ Deno.serve(async (req: Request) => {
     used_at: new Date().toISOString(),
   });
 
-  // ── ⑤ content_id を返す ─────────────────────────────────
+  // ── ⑤ Realtime broadcast をバックグラウンドで送信 ──────────
+  // レスポンスを返した後に実行される（await しない）
+  (async () => {
+    try {
+      const channel = supabase.channel(`content-${contentId}`);
+      await channel.subscribe();
+      await channel.send({
+        type: "broadcast",
+        event: "content_updated",
+        payload: {
+          id: contentId,
+          room_id: room_id,
+          file_url: track.url,
+          duration: track.duration,
+          prompt_used: promptUsed,
+          status: "pending",
+        },
+      });
+      console.log(`📡 Broadcast sent for content: ${contentId}`);
+      await channel.unsubscribe();
+    } catch (broadcastError) {
+      console.error(`❌ Broadcast failed for content ${contentId}:`, broadcastError);
+    }
+  })();
+
+  // ── ⑥ content_id を返す ─────────────────────────────────
   return new Response(
     JSON.stringify({ content_id: contentId }),
     {
