@@ -1,16 +1,7 @@
 // supabase/functions/generate-image/index.ts
-// モック版: Hugging Face の代わりにプレースホルダー画像URLを返す
+// Pollinations.ai で画像生成し Supabase Storage に保存する
 
 import { createClient } from "jsr:@supabase/supabase-js@2";
-
-const PLACEHOLDER_SEEDS = [
-  "nature1", "nature2", "city1", "city2", "abstract1",
-  "abstract2", "landscape1", "landscape2", "art1", "art2",
-];
-
-function placeholderImageUrl(seed: string): string {
-  return `https://picsum.photos/seed/${seed}/800/600`;
-}
 
 Deno.serve(async (req: Request) => {
   // CORS preflight
@@ -41,9 +32,9 @@ Deno.serve(async (req: Request) => {
   }
 
   // ── リクエストボディ ──────────────────────────────────────
-  const { room_id, prompt, user_id, request_id } = await req.json();
-  if (!room_id || !prompt || !user_id || !request_id) {
-    return errorResponse(400, "serverError", "room_id, prompt, user_id, request_id は必須です");
+  const { room_id, prompt, request_id } = await req.json();
+  if (!room_id || !prompt || !request_id) {
+    return errorResponse(400, "serverError", "room_id, prompt, request_id は必須です");
   }
 
   // ── 使用回数チェック ─────────────────────────────────────
@@ -86,61 +77,99 @@ Deno.serve(async (req: Request) => {
 
   const contentId: string = content.id;
 
-  // ── ② モック: ランダムプレースホルダーURLを選択（50ms 待機でAI処理を模倣）──
-  await new Promise((r) => setTimeout(r, 50));
-
-  const seed = PLACEHOLDER_SEEDS[Math.floor(Math.random() * PLACEHOLDER_SEEDS.length)];
-  const fileUrl = placeholderImageUrl(seed);
-  const promptUsed = `[base_prompt] ${prompt}`;
-
-  // ── ③ image_contents を pending に UPDATE ────────────────
-  const { error: updateError } = await supabase
-    .from("image_contents")
-    .update({
-      file_url: fileUrl,
-      status: "pending",
-      prompt_used: promptUsed,
-    })
-    .eq("id", contentId);
-
-  if (updateError) {
-    console.error(updateError);
-    return errorResponse(500, "serverError", "レコード更新に失敗しました");
-  }
-
-  // ── ④ ai_usage_logs に記録 ───────────────────────────────
+  // ── ② ai_usage_logs に記録 ───────────────────────────────
   await supabase.from("ai_usage_logs").insert({
     user_id: user.id,
     content_type: "image",
     used_at: new Date().toISOString(),
   });
 
-  // ── ⑤ Realtime broadcast を送信（同期実行） ──────────
-  try {
-    const channel = supabase.channel(`user:${user_id}:${request_id}`, {
-      config: { private: true }
-    });
-    await channel.subscribe();
-    await new Promise((resolve) => setTimeout(resolve, 10000))
-    await channel.send({
-      type: "broadcast",
-      event: "content_updated",
-      payload: {
-        id: contentId,
-        room_id: room_id,
-        file_url: fileUrl,
-        prompt_used: promptUsed,
-        status: "pending",
-      },
-    });
-    console.log(`📡 Broadcast sent for user:${user_id}:${request_id}`);
-    await channel.unsubscribe();
-  } catch (broadcastError) {
-    console.error(`❌ Broadcast failed for user:${user_id}:${request_id}:`, broadcastError);
-    // エラーでもレスポンスは返す（クライアント側でタイムアウト処理）
-  }
+  // ── ③ バックグラウンドで画像生成・保存・broadcast ────────
+  (async () => {
+    try {
+      // Pollinations.ai で画像生成
+      const pollinationsUrl =
+        `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}` +
+        `?width=800&height=600&nologo=true&seed=${Date.now()}`;
 
-  // ── ⑥ シンプルなレスポンスを返す ────────────────────
+      const imageResponse = await fetch(pollinationsUrl);
+      if (!imageResponse.ok) {
+        throw new Error(`Pollinations.ai エラー: ${imageResponse.status}`);
+      }
+
+      // Supabase Storage にアップロード
+      const imageBuffer = await imageResponse.arrayBuffer();
+      const storagePath = `${user.id}/${contentId}.jpg`;
+
+      const { error: uploadError } = await supabase.storage
+        .from("images")
+        .upload(storagePath, imageBuffer, { contentType: "image/jpeg" });
+
+      if (uploadError) throw uploadError;
+
+      // 公開 URL 取得
+      const { data: { publicUrl } } = supabase.storage
+        .from("images")
+        .getPublicUrl(storagePath);
+
+      // image_contents を pending に UPDATE
+      const { error: updateError } = await supabase
+        .from("image_contents")
+        .update({
+          file_url: publicUrl,
+          status: "pending",
+          prompt_used: prompt,
+        })
+        .eq("id", contentId);
+
+      if (updateError) throw updateError;
+
+      // broadcast 送信
+      const channel = supabase.channel(`user:${user.id}:${request_id}`, {
+        config: { private: true },
+      });
+      await channel.subscribe();
+      await channel.send({
+        type: "broadcast",
+        event: "content_updated",
+        payload: {
+          id: contentId,
+          room_id,
+          file_url: publicUrl,
+          prompt_used: prompt,
+          status: "pending",
+        },
+      });
+      console.log(`📡 Broadcast sent for user:${user.id}:${request_id}`);
+      await channel.unsubscribe();
+    } catch (error) {
+      console.error(`❌ Image generation failed for content ${contentId}:`, error);
+
+      // エラーステータスに更新
+      await supabase
+        .from("image_contents")
+        .update({ status: "error" })
+        .eq("id", contentId);
+
+      // エラーを broadcast で通知
+      try {
+        const channel = supabase.channel(`user:${user.id}:${request_id}`, {
+          config: { private: true },
+        });
+        await channel.subscribe();
+        await channel.send({
+          type: "broadcast",
+          event: "content_updated",
+          payload: { id: contentId, status: "error" },
+        });
+        await channel.unsubscribe();
+      } catch (broadcastError) {
+        console.error(`❌ Error broadcast failed:`, broadcastError);
+      }
+    }
+  })();
+
+  // ── ④ 即時レスポンスを返す ───────────────────────────────
   return new Response(
     JSON.stringify({ success: true }),
     {
