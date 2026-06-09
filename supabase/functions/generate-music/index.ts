@@ -47,23 +47,32 @@ Deno.serve(async (req: Request) => {
 
   // ── 使用回数チェック ─────────────────────────────────────
   const now = new Date();
-  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
+  const dayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).toISOString();
 
-  const { count } = await supabase
-    .from("ai_usage_logs")
-    .select("*", { count: "exact", head: true })
-    .eq("user_id", user.id)
-    .gte("used_at", monthStart);
+  const [{ count: usedCount }, { data: profile }, { count: bonusCount }] = await Promise.all([
+    supabase
+      .from("ai_usage_logs")
+      .select("*", { count: "exact", head: true })
+      .eq("user_id", user.id)
+      .gte("used_at", dayStart),
+    supabase
+      .from("profiles")
+      .select("is_premium")
+      .eq("id", user.id)
+      .single(),
+    supabase
+      .from("usage_bonuses")
+      .select("*", { count: "exact", head: true })
+      .eq("user_id", user.id)
+      .gte("granted_at", dayStart),
+  ]);
 
-  const { data: profile } = await supabase
-    .from("profiles")
-    .select("is_premium")
-    .eq("id", user.id)
-    .single();
+  const baseLimit = profile?.is_premium ? 100 : 10;
+  const bonusGranted = (bonusCount ?? 0) * 3;
+  const effectiveLimit = baseLimit + bonusGranted;
 
-  const limit = profile?.is_premium ? 100 : 10;
-  if ((count ?? 0) >= limit) {
-    return errorResponse(429, "usageLimitExceeded", "月の生成回数上限に達しました");
+  if ((usedCount ?? 0) >= effectiveLimit) {
+    return errorResponse(429, "usageLimitExceeded", "本日の生成回数上限に達しました");
   }
 
   // ── ① music_contents を generating で INSERT ─────────────
