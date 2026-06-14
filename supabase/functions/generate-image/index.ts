@@ -101,7 +101,12 @@ Deno.serve(async (req: Request) => {
         `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}` +
         `?width=800&height=600&nologo=true&seed=${Date.now()}`;
 
-      const imageResponse = await fetch(pollinationsUrl);
+      const pollinationsToken = Deno.env.get("POLLINATIONS_TOKEN");
+      const imageResponse = await fetch(pollinationsUrl, {
+        headers: pollinationsToken
+          ? { "Authorization": `Bearer ${pollinationsToken}` }
+          : {},
+      });
       if (!imageResponse.ok) {
         throw new Error(`Pollinations.ai エラー: ${imageResponse.status}`);
       }
